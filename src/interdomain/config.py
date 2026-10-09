@@ -16,3 +16,13 @@ def postgres_dsn() -> str:
         f"host={POSTGRES_HOST} port={POSTGRES_PORT} dbname={POSTGRES_DB} "
         f"user={POSTGRES_USER} password={POSTGRES_PASSWORD}"
     )
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
+
+KAFKA_BGP_TOPIC = os.getenv(
+    "KAFKA_BGP_TOPIC",
+    "bgp-updates",
+)
