@@ -42,6 +42,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
+      # RIS Live produces ~3k msg/s; keep about as much as Postgres retains.
+      KAFKA_LOG_RETENTION_HOURS: 6
+
     healthcheck:
       test:
         [

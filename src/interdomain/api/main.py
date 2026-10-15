@@ -7,7 +7,12 @@ from interdomain.storage.postgres import get_connection
 app = FastAPI(
     title="Interdomain API",
     version="0.1.0",
-    description="API for live BGP routing analytics.",
+    description=(
+        "API for live BGP routing analytics. Aggregate endpoints cover the "
+        "last 60 one-minute buckets, read from pre-aggregated tables. "
+        "Regions and countries describe where RIPE RIS collectors are "
+        "located, not where the affected prefixes are."
+    ),
 )
 
 
@@ -18,6 +23,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# The current (partial) minute plus the 59 before it. Same buckets as the
+# /metrics/activity series.
+WINDOW_START = "date_trunc('minute', NOW()) - INTERVAL '59 minutes'"
 
 
 @app.get("/health")
@@ -62,19 +72,21 @@ def ingestion_health():
 
 @app.get("/metrics/summary")
 def summary():
-    query = """
+    query = f"""
         SELECT
-            COUNT(*) AS total_events,
-            COUNT(*) FILTER (
-                WHERE event_type = 'announcement'
-            ) AS announcements,
-            COUNT(*) FILTER (
-                WHERE event_type = 'withdrawal'
-            ) AS withdrawals,
-            COUNT(DISTINCT peer_asn) AS unique_peer_asns,
-            COUNT(DISTINCT prefix) AS unique_prefixes
-        FROM bgp_events
-        WHERE observed_at >= NOW() - INTERVAL '1 hour';
+            COALESCE(SUM(announcements + withdrawals), 0)::bigint AS total_events,
+            COALESCE(SUM(announcements), 0)::bigint AS announcements,
+            COALESCE(SUM(withdrawals), 0)::bigint AS withdrawals,
+            COUNT(DISTINCT peer_asn) FILTER (
+                WHERE peer_asn <> 0
+            ) AS unique_peer_asns,
+            COALESCE((
+                SELECT unique_prefixes
+                FROM bgp_prefix_counts
+                WHERE scope = 'global' AND key = 'all'
+            ), 0) AS unique_prefixes
+        FROM bgp_minute_stats
+        WHERE minute >= {WINDOW_START};
     """
 
     with get_connection() as conn:
@@ -91,30 +103,66 @@ def summary():
         "unique_prefixes": row[4],
     }
 
+@app.get("/regions/summary")
+def regional_summary():
+    query = f"""
+        SELECT
+            stats.collector_region AS region,
+            SUM(stats.announcements + stats.withdrawals)::bigint AS total_events,
+            SUM(stats.announcements)::bigint AS announcements,
+            SUM(stats.withdrawals)::bigint AS withdrawals,
+            COUNT(DISTINCT stats.collector) FILTER (
+                WHERE stats.collector <> 'unknown'
+            ) AS collectors,
+            COUNT(DISTINCT stats.peer_asn) FILTER (
+                WHERE stats.peer_asn <> 0
+            ) AS unique_peer_asns,
+            COALESCE(MAX(counts.unique_prefixes), 0) AS unique_prefixes
+        FROM bgp_minute_stats AS stats
+        LEFT JOIN bgp_prefix_counts AS counts
+            ON counts.scope = 'region'
+            AND counts.key = stats.collector_region
+        WHERE stats.minute >= {WINDOW_START}
+        GROUP BY stats.collector_region
+        ORDER BY total_events DESC;
+    """
 
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    return [
+        {
+            "region": row[0],
+            "total_events": row[1],
+            "announcements": row[2],
+            "withdrawals": row[3],
+            "collectors": row[4],
+            "unique_peer_asns": row[5],
+            "unique_prefixes": row[6],
+        }
+        for row in rows
+    ]
 @app.get("/metrics/activity")
 def routing_activity():
-    query = """
+    query = f"""
         WITH minutes AS (
             SELECT generate_series(
-                date_trunc('minute', NOW()) - INTERVAL '59 minutes',
+                {WINDOW_START},
                 date_trunc('minute', NOW()),
                 INTERVAL '1 minute'
             ) AS minute
         ),
         activity AS (
             SELECT
-                date_trunc('minute', observed_at) AS minute,
-                COUNT(*) AS updates,
-                COUNT(*) FILTER (
-                    WHERE event_type = 'announcement'
-                ) AS announcements,
-                COUNT(*) FILTER (
-                    WHERE event_type = 'withdrawal'
-                ) AS withdrawals
-            FROM bgp_events
-            WHERE observed_at >= NOW() - INTERVAL '1 hour'
-            GROUP BY 1
+                minute,
+                SUM(announcements + withdrawals)::bigint AS updates,
+                SUM(announcements)::bigint AS announcements,
+                SUM(withdrawals)::bigint AS withdrawals
+            FROM bgp_minute_stats
+            WHERE minute >= {WINDOW_START}
+            GROUP BY minute
         )
         SELECT
             minutes.minute,
@@ -153,7 +201,9 @@ def recent_routes(
             prefix::text,
             event_type,
             as_path,
-            next_hop::text
+            next_hop::text,
+            collector,
+            collector_region
         FROM bgp_events
         ORDER BY observed_at DESC
         LIMIT %s;
@@ -172,6 +222,8 @@ def recent_routes(
             "event_type": row[3],
             "as_path": row[4],
             "next_hop": row[5],
+            "collector": row[6],
+            "collector_region": row[7],
         }
         for row in rows
     ]
@@ -213,12 +265,12 @@ def withdrawals(
 def active_asns(
     limit: int = Query(default=10, ge=1, le=100)
 ):
-    query = """
+    query = f"""
         SELECT
-            peer_asn,
-            COUNT(*) AS update_count
-        FROM bgp_events
-        WHERE observed_at >= NOW() - INTERVAL '1 hour'
+            NULLIF(peer_asn, 0) AS peer_asn,
+            SUM(announcements + withdrawals)::bigint AS update_count
+        FROM bgp_minute_stats
+        WHERE minute >= {WINDOW_START}
         GROUP BY peer_asn
         ORDER BY update_count DESC
         LIMIT %s;
@@ -233,6 +285,51 @@ def active_asns(
         {
             "peer_asn": row[0],
             "update_count": row[1],
+        }
+        for row in rows
+    ]
+
+@app.get("/collectors/activity")
+def collector_activity():
+    query = f"""
+        SELECT
+            stats.collector,
+            stats.collector_region,
+            SUM(stats.announcements + stats.withdrawals)::bigint AS total_events,
+            SUM(stats.announcements)::bigint AS announcements,
+            SUM(stats.withdrawals)::bigint AS withdrawals,
+            COUNT(DISTINCT stats.peer_asn) FILTER (
+                WHERE stats.peer_asn <> 0
+            ) AS unique_peer_asns,
+            COALESCE(MAX(counts.unique_prefixes), 0) AS unique_prefixes
+        FROM bgp_minute_stats AS stats
+        LEFT JOIN bgp_prefix_counts AS counts
+            ON counts.scope = 'collector'
+            AND counts.key = stats.collector
+        WHERE
+            stats.minute >= {WINDOW_START}
+            AND stats.collector <> 'unknown'
+        GROUP BY
+            stats.collector,
+            stats.collector_region
+        ORDER BY
+            total_events DESC;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    return [
+        {
+            "collector": row[0],
+            "collector_region": row[1],
+            "total_events": row[2],
+            "announcements": row[3],
+            "withdrawals": row[4],
+            "unique_peer_asns": row[5],
+            "unique_prefixes": row[6],
         }
         for row in rows
     ]

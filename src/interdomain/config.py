@@ -26,3 +26,19 @@ KAFKA_BGP_TOPIC = os.getenv(
     "KAFKA_BGP_TOPIC",
     "bgp-updates",
 )
+
+# Kafka messages written to Postgres per COPY + offset commit.
+CONSUMER_BATCH_SIZE = int(
+    os.getenv("CONSUMER_BATCH_SIZE", "5000")
+)
+
+# Raw bgp_events partitions older than this are dropped by
+# scripts/run_maintenance.py. Dashboard metrics come from the rollups.
+RAW_RETENTION_HOURS = float(
+    os.getenv("RAW_RETENTION_HOURS", "2")
+)
+
+# bgp_minute_stats rows older than this are deleted.
+ROLLUP_RETENTION_DAYS = float(
+    os.getenv("ROLLUP_RETENTION_DAYS", "7")
+)
