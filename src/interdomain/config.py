@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from psycopg.conninfo import make_conninfo
 
 load_dotenv()
 
@@ -8,13 +9,24 @@ POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_DB = os.getenv("POSTGRES_DB", "interdomain")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "interdomain")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "interdomain")
+# No default: a password shipped in the code is a password everyone knows.
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 
 
 def postgres_dsn() -> str:
-    return (
-        f"host={POSTGRES_HOST} port={POSTGRES_PORT} dbname={POSTGRES_DB} "
-        f"user={POSTGRES_USER} password={POSTGRES_PASSWORD}"
+    if not POSTGRES_PASSWORD:
+        raise RuntimeError(
+            "POSTGRES_PASSWORD is not set. Copy .env.example to .env and "
+            "choose a password."
+        )
+
+    # make_conninfo quotes values, so a password with spaces or quotes works.
+    return make_conninfo(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
     )
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
