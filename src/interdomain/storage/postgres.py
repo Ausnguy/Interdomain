@@ -297,19 +297,43 @@ def ensure_partitions(
             if name in existing:
                 continue
 
-            cur.execute(
-                sql.SQL(
-                    "CREATE TABLE IF NOT EXISTS {} PARTITION OF bgp_events "
-                    "FOR VALUES FROM ({}) TO ({})"
-                ).format(
-                    sql.Identifier(name),
-                    sql.Literal(f"{start:%Y-%m-%d %H}:00:00+00"),
-                    sql.Literal(f"{start + timedelta(hours=1):%Y-%m-%d %H}:00:00+00"),
+            try:
+                cur.execute(
+                    sql.SQL(
+                        "CREATE TABLE IF NOT EXISTS {} PARTITION OF bgp_events "
+                        "FOR VALUES FROM ({}) TO ({})"
+                    ).format(
+                        sql.Identifier(name),
+                        sql.Literal(f"{start:%Y-%m-%d %H}:00:00+00"),
+                        sql.Literal(f"{start + timedelta(hours=1):%Y-%m-%d %H}:00:00+00"),
+                    )
                 )
-            )
+            except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+                # IF NOT EXISTS is not safe against two sessions creating the
+                # same table at once. The loser can just move on: the
+                # partition exists, which is what was wanted.
+                continue
+
             created.append(name)
 
     return created
+
+
+# Any fixed number works, as long as every maintenance process uses it.
+MAINTENANCE_LOCK_KEY = 4_821_001
+
+
+def try_maintenance_lock(conn: psycopg.Connection) -> bool:
+    """Take the cluster-wide maintenance lock without waiting.
+
+    A session-level advisory lock lives as long as this connection, and the
+    server releases it if the connection drops, so a crashed process can
+    never leave it stuck. Call once per new connection: the lock is
+    re-entrant, so repeated calls on the same session stack up.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (MAINTENANCE_LOCK_KEY,))
+        return cur.fetchone()[0]
 
 
 def drop_partitions_older_than(
@@ -346,10 +370,16 @@ def drop_partitions_older_than(
             range_end = datetime.strptime(match.group(1), "%Y%m%d%H") + timedelta(hours=1)
 
             if range_end <= now_utc - timedelta(hours=hours):
-                with conn.transaction():
-                    # Don't queue behind long queries while holding up others.
-                    cur.execute("SET LOCAL lock_timeout = '5s'")
-                    cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(name)))
+                try:
+                    with conn.transaction():
+                        # Don't queue behind long queries while holding up others.
+                        cur.execute("SET LOCAL lock_timeout = '5s'")
+                        cur.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(name)))
+                except psycopg.errors.LockNotAvailable:
+                    # A query still uses this partition. Retry next cycle
+                    # instead of abandoning the other partitions in this pass.
+                    continue
+
                 dropped.append(name)
 
     return dropped

@@ -23,7 +23,9 @@ from interdomain.storage.postgres import (
     drop_partitions_older_than,
     ensure_partitions,
     refresh_prefix_counts,
+    try_maintenance_lock,
 )
+from interdomain.storage.maintenance import run_step
 
 
 PREFIX_COUNTS_INTERVAL_SECONDS = 30
@@ -32,10 +34,27 @@ PARTITION_HOURS_AHEAD = 3
 
 
 def run_retention(conn) -> None:
-    created = ensure_partitions(conn, PARTITION_HOURS_AHEAD)
-    dropped = drop_partitions_older_than(conn, RAW_RETENTION_HOURS)
-    stats_deleted = delete_minute_stats_older_than(conn, ROLLUP_RETENTION_DAYS)
-    prefixes_deleted = delete_stale_prefix_seen(conn)
+    # Each step is isolated: a failure in one must not skip the others.
+    created = run_step(
+        "Creating partitions",
+        lambda: ensure_partitions(conn, PARTITION_HOURS_AHEAD),
+        [],
+    )
+    dropped = run_step(
+        "Dropping partitions",
+        lambda: drop_partitions_older_than(conn, RAW_RETENTION_HOURS),
+        [],
+    )
+    stats_deleted = run_step(
+        "Deleting minute stats",
+        lambda: delete_minute_stats_older_than(conn, ROLLUP_RETENTION_DAYS),
+        0,
+    )
+    prefixes_deleted = run_step(
+        "Deleting stale prefixes",
+        lambda: delete_stale_prefix_seen(conn),
+        0,
+    )
 
     print(
         f"Retention: created {created or 'no'} partitions, "
@@ -60,6 +79,15 @@ def main():
             try:
                 if conn is None or conn.closed:
                     conn = connect()
+
+                    # Only one maintenance process may run: two would race to
+                    # create and drop the same partitions.
+                    if not try_maintenance_lock(conn):
+                        print("Another maintenance process holds the lock; waiting...")
+                        conn.close()
+                        conn = None
+                        time.sleep(PREFIX_COUNTS_INTERVAL_SECONDS)
+                        continue
 
                 started = time.monotonic()
                 refresh_prefix_counts(conn)
