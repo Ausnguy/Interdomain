@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Any
 
+from interdomain.processing.regions import get_region
+
 
 def normalize_next_hop(value: Any) -> str | None:
     if value is None:
@@ -25,11 +27,15 @@ def normalize_bgp_event(event: dict[str, Any]) -> list[dict[str, Any]]:
         else datetime.now(timezone.utc)
     )
 
+    collector = event.get("host")
+
     common = {
         "observed_at": observed_at,
         "peer": event.get("peer"),
         "peer_asn": event.get("peer_asn"),
         "path": event.get("path"),
+        "collector": collector,
+        "collector_region": get_region(collector),
     }
 
     for announcement in event.get("announcements", []) or []:
