@@ -22,6 +22,15 @@ jobs:
       # The tests need no database or Kafka: they cover pure logic with fakes.
       - run: python -m pytest -q
 
+  images:
+    runs-on: ubuntu-latest
+    env:
+      # Compose requires a value to interpolate; the build never uses it.
+      POSTGRES_PASSWORD: ci-only-not-a-secret
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile app build api web
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

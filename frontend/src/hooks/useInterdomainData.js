@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 
 
-export const API = "http://127.0.0.1:8000";
+// Set VITE_API_URL at build time. The container build uses "/api" so the
+// browser talks to the same origin and nginx forwards to the API.
+export const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
 export const POLL_INTERVAL_MS = 5000;
 

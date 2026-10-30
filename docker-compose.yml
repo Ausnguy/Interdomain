@@ -1,3 +1,25 @@
+# Local development only needs postgres and kafka:
+#   docker compose up -d postgres kafka
+# The full stack (migrations, producer, consumer, maintenance, API, web) is
+# behind the "app" profile:
+#   docker compose --profile app up -d --build
+x-app: &app
+  build: .
+  image: interdomain-app
+  profiles: [app]
+  restart: unless-stopped
+  environment:
+    # Inside the compose network the services are reached by name, not localhost.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB:-interdomain}
+    POSTGRES_USER: ${POSTGRES_USER:-interdomain}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    KAFKA_BGP_TOPIC: bgp-updates
+    RAW_RETENTION_HOURS: ${RAW_RETENTION_HOURS:-2}
+    ROLLUP_RETENTION_DAYS: ${ROLLUP_RETENTION_DAYS:-7}
+
 services:
   postgres:
     image: postgres:17
@@ -83,6 +105,63 @@ services:
       - --packages
       - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0
       - /opt/interdomain/spark/bgp_stream.py
+
+  # One-shot: creates or upgrades the tables, then exits. Everything else waits for it.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["python", "scripts/init_db.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "interdomain.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  producer:
+    <<: *app
+    command: ["python", "scripts/run_producer.py"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    command: ["python", "scripts/run_consumer.py"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  maintenance:
+    <<: *app
+    command: ["python", "scripts/run_maintenance.py"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Static dashboard plus a reverse proxy for /api. Localhost only: put a
+  # tunnel or TLS proxy in front of it to expose it.
+  web:
+    build: ./frontend
+    image: interdomain-web
+    profiles: [app]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   interdomain_postgres_data:
