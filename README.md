@@ -68,7 +68,18 @@ uvicorn interdomain.api.main:app --app-dir src --reload   # terminal 4
 cd frontend && npm ci && npm run dev                      # terminal 5
 ```
 
-On Windows, `scripts\dev.ps1` starts all of this in separate windows
+To run everything in containers instead (migrations, producer, consumer,
+maintenance, API and the dashboard behind nginx):
+
+```bash
+docker compose --profile app up -d --build
+# dashboard: http://127.0.0.1:8080
+```
+
+Do not run the containerized and local consumers at the same time: they share
+one Kafka consumer group, and the topic has a single partition.
+
+On Windows, `scripts\dev.ps1` starts all of the local version in separate windows
 (`-Spark` also starts the Spark prototype). The API docs are at
 `http://127.0.0.1:8000/docs` and the dashboard at `http://localhost:5173`.
 
