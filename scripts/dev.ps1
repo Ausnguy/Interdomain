@@ -1,3 +1,9 @@
+param(
+    # Spark is only a prototype that prints to the console and uses 1-2 GB of
+    # RAM, so it is off unless you ask for it: .\scripts\dev.ps1 -Spark
+    [switch]$Spark
+)
+
 $Root = Split-Path -Parent $PSScriptRoot
 $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 $VenvUvicorn = Join-Path $Root ".venv\Scripts\uvicorn.exe"
@@ -6,7 +12,10 @@ Write-Host "Starting Interdomain infrastructure..."
 
 Set-Location $Root
 
-docker compose up -d postgres kafka spark
+$Services = @("postgres", "kafka")
+if ($Spark) { $Services += "spark" }
+
+docker compose up -d @Services
 
 Write-Host "Waiting for infrastructure..."
 Start-Sleep -Seconds 8
@@ -46,4 +55,6 @@ Write-Host "Interdomain started."
 Write-Host "Dashboard: http://localhost:5173"
 Write-Host "API Docs:  http://127.0.0.1:8000/docs"
 Write-Host ""
-Write-Host "Spark logs: docker compose logs -f spark"
+if ($Spark) {
+    Write-Host "Spark logs: docker compose logs -f spark"
+}
