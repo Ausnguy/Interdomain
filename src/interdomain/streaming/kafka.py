@@ -1,7 +1,7 @@
 import json
 from typing import Any, Callable, Iterable
 
-from confluent_kafka import Consumer, KafkaError, Producer
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
 from interdomain.config import (
     KAFKA_BGP_TOPIC,
@@ -19,8 +19,75 @@ def create_producer() -> Producer:
             # work on whole batches instead of single messages.
             "compression.type": "lz4",
             "linger.ms": 20,
+            # Retries cannot create duplicates or reorder messages: the broker
+            # drops a resend it has already stored. Implies acks=all.
+            "enable.idempotence": True,
         }
     )
+
+
+class DeliveryStats:
+    """Counts what the broker confirmed, not just what was queued.
+
+    produce() only puts a message in a local queue. The broker's answer
+    arrives later, as a callback fired from poll() or flush().
+    """
+
+    def __init__(self) -> None:
+        self.delivered = 0
+        self.failed = 0
+        self.last_error: str | None = None
+
+    def on_delivery(self, err, msg) -> None:
+        if err is None:
+            self.delivered += 1
+        else:
+            self.failed += 1
+            self.last_error = str(err)
+
+
+def resolve_start_offset(
+    stored: int,
+    low: int,
+    high: int,
+) -> tuple[int, str | None]:
+    """Decide where to resume, given Postgres' offset and what Kafka still holds.
+
+    `low` is the oldest offset Kafka retains and `high` is the next offset it
+    will assign. Returns (offset to start at, warning or None).
+    """
+    if stored < low:
+        return low, (
+            f"stored offset {stored:,} is older than Kafka's oldest message "
+            f"({low:,}); {low - stored:,} messages expired before they were "
+            f"read. Resuming at {low:,}."
+        )
+
+    if stored > high:
+        return low, (
+            f"stored offset {stored:,} is past Kafka's newest ({high:,}); "
+            f"the topic was probably recreated. Restarting at {low:,}."
+        )
+
+    return stored, None
+
+
+def _checked_start(consumer: Consumer, partition, stored: int) -> int:
+    try:
+        low, high = consumer.get_watermark_offsets(partition, timeout=5.0)
+    except KafkaException as exc:
+        print(
+            f"Could not check offsets for {partition.topic}[{partition.partition}] "
+            f"({exc}); using stored offset {stored:,}"
+        )
+        return stored
+
+    offset, warning = resolve_start_offset(stored, low, high)
+
+    if warning:
+        print(f"WARNING {partition.topic}[{partition.partition}]: {warning}")
+
+    return offset
 
 
 def create_consumer(
@@ -51,7 +118,11 @@ def create_consumer(
 
         for partition in partitions:
             if partition.partition in stored:
-                partition.offset = stored[partition.partition]
+                partition.offset = _checked_start(
+                    consumer,
+                    partition,
+                    stored[partition.partition],
+                )
 
         consumer.assign(partitions)
 
@@ -72,14 +143,27 @@ def create_consumer(
 def produce_bgp_event(
     producer: Producer,
     event: dict,
+    on_delivery: Callable | None = None,
+    queue_full_retries: int = 5,
 ) -> None:
     peer_asn = event.get("peer_asn")
 
-    producer.produce(
-        topic=KAFKA_BGP_TOPIC,
-        key=str(peer_asn) if peer_asn else None,
-        value=json.dumps(event),
-    )
+    for _ in range(queue_full_retries):
+        try:
+            producer.produce(
+                topic=KAFKA_BGP_TOPIC,
+                key=str(peer_asn) if peer_asn else None,
+                value=json.dumps(event),
+                on_delivery=on_delivery,
+            )
+            break
+        except BufferError:
+            # The local queue is full: Kafka (or the network) is slower than
+            # the feed. Block briefly so the queue can drain instead of
+            # dropping the event or growing memory without limit.
+            producer.poll(1.0)
+    else:
+        raise BufferError("Kafka producer queue stayed full; giving up on this event")
 
     producer.poll(0)
 
@@ -120,7 +204,10 @@ def decode_batch(
                 )
             )
         except Exception as exc:
-            print(f"Skipping undecodable Kafka message: {exc}")
+            print(
+                f"Skipping undecodable message at "
+                f"{key[0]}[{key[1]}]@{message.offset():,}: {exc}"
+            )
             skipped += 1
 
     return rows, skipped, offsets
